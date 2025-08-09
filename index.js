@@ -107,7 +107,7 @@ function getThemeForSession(sessionName) {
 }
 
 // Set tmux status bar colors and configuration for a session
-async function setSessionColors(sessionName) {
+async function setSessionColors(sessionName, useSplitScreen = true) {
   const theme = getThemeForSession(sessionName);
   
   try {
@@ -131,16 +131,26 @@ async function setSessionColors(sessionName) {
       `tmux set-window-option -t "${sessionName}" mode-keys vi`,
       `tmux set-option -t "${sessionName}" renumber-windows on`,
       
-      // Auto split screen keybindings
-      `tmux bind-key -t "${sessionName}" c new-window \\; split-window -h -c "#{pane_current_path}" \\; select-pane -L`,
-      `tmux bind-key -t "${sessionName}" S new-session \\; split-window -h -c "#{pane_current_path}" \\; select-pane -L`,
-      
       // Clipboard integration
       `tmux bind-key -t "${sessionName}" -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "pbcopy"`,
       `tmux bind-key -t "${sessionName}" -T copy-mode-vi v send-keys -X begin-selection`,
       `tmux bind-key -t "${sessionName}" -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "pbcopy"`,
       `tmux bind-key -t "${sessionName}" p paste-buffer`
     ];
+    
+    // Conditionally add auto split screen keybindings
+    if (useSplitScreen) {
+      commands.push(
+        `tmux bind-key -t "${sessionName}" c new-window \\; split-window -h -c "#{pane_current_path}" \\; select-pane -L`,
+        `tmux bind-key -t "${sessionName}" S new-session \\; split-window -h -c "#{pane_current_path}" \\; select-pane -L`
+      );
+    } else {
+      // Standard keybindings for single pane mode
+      commands.push(
+        `tmux bind-key -t "${sessionName}" c new-window -c "#{pane_current_path}"`,
+        `tmux bind-key -t "${sessionName}" S new-session -c "#{pane_current_path}"`
+      );
+    }
     
     // Execute all color commands
     for (const cmd of commands) {
@@ -154,11 +164,35 @@ async function setSessionColors(sessionName) {
   }
 }
 
+// Ask user about split screen preference for new sessions
+async function askSplitScreenPreference() {
+  return new Promise((resolve) => {
+    console.log();
+    console.log(`${colors.yellow}Session Layout Preference:${colors.reset}`);
+    console.log(`${colors.white}1. Single pane (default)${colors.reset}`);
+    console.log(`${colors.white}2. Split screen (left/right)${colors.reset}`);
+    console.log();
+    
+    rl.question(`${colors.cyan}Choose layout (1-2, Enter for single): ${colors.reset}`, (answer) => {
+      const choice = answer.trim();
+      const useSplitScreen = choice === '2';
+      
+      if (useSplitScreen) {
+        console.log(`${colors.green}✓ Split screen layout selected${colors.reset}`);
+      } else {
+        console.log(`${colors.green}✓ Single pane layout selected${colors.reset}`);
+      }
+      
+      resolve(useSplitScreen);
+    });
+  });
+}
+
 // Clear screen and show header
 function showHeader() {
   console.clear();
   console.log(`${colors.cyan}╔═══════════════════════════════════════════════════════════╗${colors.reset}`);
-  console.log(`${colors.cyan}║${colors.white}${colors.bright}                    TMUX SESSION MANAGER                   ${colors.cyan}║${colors.reset}`);
+  console.log(`${colors.cyan}║${colors.white}${colors.bright}                    TMUX SESSION MANAGER                   ${colors.reset}`);
   console.log(`${colors.cyan}╚═══════════════════════════════════════════════════════════╝${colors.reset}`);
   console.log();
 }
@@ -399,15 +433,22 @@ async function createNewSession() {
       // Session doesn't exist, create it
       const theme = getThemeForSession(sessionName);
       console.log(`${colors.green}Creating session: ${sessionName} (${theme.name} theme)${colors.reset}`);
+      
+      // Ask user about split screen preference
+      const useSplitScreen = await askSplitScreenPreference();
       await sleep(500);
       
-      // Create session in detached mode with auto-split, then set colors, then attach
+      // Create session in detached mode, optionally with split, then set colors, then attach
       try {
         await execPromise(`tmux new-session -d -s "${sessionName}"`);
-        // Auto-split the initial window
-        await execPromise(`tmux split-window -h -t "${sessionName}:0" -c "#{pane_current_path}"`);
-        await execPromise(`tmux select-pane -t "${sessionName}:0.0"`);
-        await setSessionColors(sessionName);
+        
+        // Conditionally auto-split the initial window
+        if (useSplitScreen) {
+          await execPromise(`tmux split-window -h -t "${sessionName}:0" -c "#{pane_current_path}"`);
+          await execPromise(`tmux select-pane -t "${sessionName}:0.0"`);
+        }
+        
+        await setSessionColors(sessionName, useSplitScreen);
         
         rl.close();
         const tmux = spawn('tmux', ['attach-session', '-t', sessionName], {
