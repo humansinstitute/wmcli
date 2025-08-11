@@ -192,7 +192,7 @@ async function askSplitScreenPreference() {
 function showHeader() {
   console.clear();
   console.log(`${colors.cyan}╔═══════════════════════════════════════════════════════════╗${colors.reset}`);
-  console.log(`${colors.cyan}║${colors.white}${colors.bright}                    TMUX SESSION MANAGER                   ${colors.reset}`);
+  console.log(`${colors.cyan}║${colors.white}${colors.bright}                      Wingman CLI !!                        ${colors.reset}`);
   console.log(`${colors.cyan}╚═══════════════════════════════════════════════════════════╝${colors.reset}`);
   console.log();
 }
@@ -228,7 +228,21 @@ async function getSessionInfo(sessionName) {
       `tmux list-sessions -F "#{session_name}:#{session_windows}:#{?session_attached,attached,not attached}" | grep "^${sessionName}:"`
     );
     const [, windows, status] = stdout.trim().split(':');
-    return `${windows} windows, ${status}`;
+    
+    // Try to get session description if set
+    let description = '';
+    try {
+      const { stdout: descOutput } = await execPromise(
+        `tmux show-option -t "${sessionName}" -qv @description`
+      );
+      if (descOutput.trim()) {
+        description = ` - ${descOutput.trim()}`;
+      }
+    } catch (e) {
+      // No description set
+    }
+    
+    return `${windows} windows, ${status}${description}`;
   } catch (error) {
     return 'unknown';
   }
@@ -317,6 +331,7 @@ async function connectToSession() {
     }
     
     console.log(`${colors.white}c)${colors.reset} Create new session`);
+    console.log(`${colors.white}e)${colors.reset} Edit session (rename/description)`);
     console.log(`${colors.white}d)${colors.reset} Delete session`);
     console.log(`${colors.white}r)${colors.reset} Refresh`);
     console.log(`${colors.white}q)${colors.reset} Quit`);
@@ -370,6 +385,10 @@ async function connectToSession() {
         case 'c':
           await createNewSession();
           return;
+        case 'e':
+          await editSession();
+          currentPage = 0;
+          break;
         case 'd':
           await deleteSession();
           currentPage = 0;
@@ -436,6 +455,11 @@ async function createNewSession() {
       
       // Ask user about split screen preference
       const useSplitScreen = await askSplitScreenPreference();
+      
+      // Ask for optional description
+      console.log();
+      const description = await question(`${colors.cyan}Enter session description (optional): ${colors.reset}`);
+      
       await sleep(500);
       
       // Create session in detached mode, optionally with split, then set colors, then attach
@@ -449,6 +473,15 @@ async function createNewSession() {
         }
         
         await setSessionColors(sessionName, useSplitScreen);
+        
+        // Set description if provided
+        if (description) {
+          try {
+            await execPromise(`tmux set-option -t "${sessionName}" @description "${description}"`);
+          } catch (e) {
+            // Ignore error if session doesn't exist yet
+          }
+        }
         
         rl.close();
         const tmux = spawn('tmux', ['attach-session', '-t', sessionName], {
@@ -464,6 +497,172 @@ async function createNewSession() {
         console.log(`${colors.red}Failed to create session: ${createError.message}${colors.reset}`);
         await sleep(1000);
         continue;
+      }
+    }
+  }
+}
+
+// Edit session (rename and/or set description)
+async function editSession() {
+  while (true) {
+    showHeader();
+    console.log(`${colors.yellow}Edit Tmux Session${colors.reset}`);
+    console.log(`${colors.blue}─────────────────────────────────${colors.reset}`);
+    console.log();
+    
+    const sessions = await getSessions();
+    const hasSessions = await displaySessions(sessions);
+    
+    if (!hasSessions) {
+      console.log();
+      console.log(`${colors.yellow}No sessions to edit${colors.reset}`);
+      console.log(`${colors.white}Press Enter to return...${colors.reset}`);
+      await question('');
+      return;
+    }
+    
+    const totalSessions = sessions.length;
+    const startIdx = currentPage * SESSIONS_PER_PAGE;
+    const endIdx = Math.min(startIdx + SESSIONS_PER_PAGE, totalSessions);
+    const totalPages = Math.ceil(totalSessions / SESSIONS_PER_PAGE);
+    
+    console.log();
+    console.log(`${colors.yellow}Options:${colors.reset}`);
+    console.log(`${colors.white}1-9)${colors.reset} Select session to edit`);
+    
+    if (totalPages > 1) {
+      if (currentPage > 0) {
+        console.log(`${colors.white}p)${colors.reset} Previous page`);
+      }
+      if (currentPage + 1 < totalPages) {
+        console.log(`${colors.white}n)${colors.reset} Next page`);
+      }
+    }
+    
+    console.log(`${colors.white}r)${colors.reset} Refresh`);
+    console.log(`${colors.white}q)${colors.reset} Back to menu`);
+    console.log();
+    
+    const choice = await question('Enter your choice: ');
+    
+    if (/^[1-9]$/.test(choice)) {
+      const sessionIdx = startIdx + parseInt(choice) - 1;
+      if (sessionIdx < endIdx && sessionIdx < totalSessions) {
+        const selectedSession = sessions[sessionIdx];
+        
+        // Edit submenu
+        console.log();
+        console.log(`${colors.cyan}Editing session: ${colors.green}${selectedSession}${colors.reset}`);
+        console.log();
+        console.log(`${colors.yellow}What would you like to do?${colors.reset}`);
+        console.log(`${colors.white}1)${colors.reset} Rename session`);
+        console.log(`${colors.white}2)${colors.reset} Set/update description`);
+        console.log(`${colors.white}3)${colors.reset} Both`);
+        console.log(`${colors.white}q)${colors.reset} Cancel`);
+        console.log();
+        
+        const editChoice = await question('Enter your choice: ');
+        
+        if (editChoice === '1' || editChoice === '3') {
+          // Rename session
+          console.log();
+          const newName = await question(`Enter new name for session (current: ${selectedSession}): `);
+          
+          if (newName && newName !== selectedSession) {
+            // Check if new name already exists
+            try {
+              await execPromise(`tmux has-session -t "${newName}"`);
+              console.log(`${colors.red}Session '${newName}' already exists${colors.reset}`);
+              await sleep(2000);
+              continue;
+            } catch (e) {
+              // Name doesn't exist, proceed with rename
+              try {
+                await execPromise(`tmux rename-session -t "${selectedSession}" "${newName}"`);
+                console.log(`${colors.green}Session renamed from '${selectedSession}' to '${newName}'${colors.reset}`);
+                
+                // Update the selected session name for description setting
+                if (editChoice === '3') {
+                  selectedSession = newName;
+                }
+              } catch (error) {
+                console.log(`${colors.red}Failed to rename session: ${error.message}${colors.reset}`);
+                await sleep(2000);
+                continue;
+              }
+            }
+          }
+        }
+        
+        if (editChoice === '2' || editChoice === '3') {
+          // Set description
+          console.log();
+          
+          // Get current description if exists
+          let currentDesc = '';
+          try {
+            const { stdout } = await execPromise(
+              `tmux show-option -t "${selectedSession}" -qv @description`
+            );
+            currentDesc = stdout.trim();
+          } catch (e) {
+            // No description set
+          }
+          
+          if (currentDesc) {
+            console.log(`${colors.cyan}Current description: ${colors.white}${currentDesc}${colors.reset}`);
+          }
+          
+          const newDesc = await question('Enter new description (or leave empty to clear): ');
+          
+          try {
+            if (newDesc) {
+              await execPromise(`tmux set-option -t "${selectedSession}" @description "${newDesc}"`);
+              console.log(`${colors.green}Description updated for session '${selectedSession}'${colors.reset}`);
+            } else if (currentDesc) {
+              await execPromise(`tmux set-option -t "${selectedSession}" -u @description`);
+              console.log(`${colors.green}Description cleared for session '${selectedSession}'${colors.reset}`);
+            }
+          } catch (error) {
+            console.log(`${colors.red}Failed to update description: ${error.message}${colors.reset}`);
+          }
+        }
+        
+        if (editChoice === '1' || editChoice === '2' || editChoice === '3') {
+          await sleep(2000);
+        }
+        
+        currentPage = 0;
+      } else {
+        console.log(`${colors.red}Invalid session number${colors.reset}`);
+        await sleep(1000);
+      }
+    } else {
+      switch(choice.toLowerCase()) {
+        case 'p':
+          if (currentPage > 0) {
+            currentPage--;
+          } else {
+            console.log(`${colors.red}Already on first page${colors.reset}`);
+            await sleep(1000);
+          }
+          break;
+        case 'n':
+          if (currentPage + 1 < totalPages) {
+            currentPage++;
+          } else {
+            console.log(`${colors.red}Already on last page${colors.reset}`);
+            await sleep(1000);
+          }
+          break;
+        case 'r':
+          currentPage = 0;
+          break;
+        case 'q':
+          return;
+        default:
+          console.log(`${colors.red}Invalid option${colors.reset}`);
+          await sleep(1000);
       }
     }
   }
@@ -590,7 +789,8 @@ async function showMainMenu() {
     console.log(`${colors.blue}─────────────────────────────────${colors.reset}`);
     console.log(`${colors.white}1)${colors.reset} Connect to existing sessions`);
     console.log(`${colors.white}2)${colors.reset} Create new session`);
-    console.log(`${colors.white}3)${colors.reset} Delete session`);
+    console.log(`${colors.white}3)${colors.reset} Edit session (rename/description)`);
+    console.log(`${colors.white}4)${colors.reset} Delete session`);
     console.log(`${colors.white}q)${colors.reset} Quit`);
     console.log();
     
@@ -606,6 +806,10 @@ async function showMainMenu() {
         break;
       case '3':
         currentPage = 0;
+        await editSession();
+        break;
+      case '4':
+        currentPage = 0;
         await deleteSession();
         break;
       case 'q':
@@ -613,7 +817,7 @@ async function showMainMenu() {
         console.log(`${colors.green}Goodbye!${colors.reset}`);
         process.exit(0);
       default:
-        console.log(`${colors.red}Invalid option. Please choose 1, 2, 3, or q${colors.reset}`);
+        console.log(`${colors.red}Invalid option. Please choose 1, 2, 3, 4, or q${colors.reset}`);
         await sleep(1000);
     }
   }
