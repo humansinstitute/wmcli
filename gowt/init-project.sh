@@ -250,7 +250,7 @@ determine_init_mode() {
 setup_project_structure() {
     print_info "Setting up project structure..."
     
-    mkdir -p src/{controllers,models,services,utils,middleware}
+    mkdir -p src/{controllers,models,services,utils,middleware,db}
     mkdir -p tests/{unit,integration}
     mkdir -p config
     mkdir -p public/{css,js,images}
