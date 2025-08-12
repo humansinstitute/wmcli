@@ -22,6 +22,17 @@ const colors = {
 const SESSIONS_PER_PAGE = 9;
 let currentPage = 0;
 
+// Project context detection
+let projectContext = {
+  name: null,
+  type: null,
+  hasPackageJson: false,
+  hasWorktrees: false,
+  hasMenuScript: false,
+  devCommand: null,
+  testCommand: null
+};
+
 // Tmux status bar color themes
 const statusThemes = [
   {
@@ -100,6 +111,73 @@ function hashString(str) {
   return Math.abs(hash);
 }
 
+// Detect project context
+async function detectProjectContext() {
+  const fs = require('fs');
+  const path = require('path');
+  
+  try {
+    // Check for package.json
+    if (fs.existsSync('package.json')) {
+      projectContext.hasPackageJson = true;
+      try {
+        const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+        projectContext.name = packageJson.name || path.basename(process.cwd());
+        projectContext.type = 'nodejs';
+        
+        // Detect common scripts
+        if (packageJson.scripts) {
+          if (packageJson.scripts.dev) projectContext.devCommand = 'dev';
+          else if (packageJson.scripts.start) projectContext.devCommand = 'start';
+          else if (packageJson.scripts.serve) projectContext.devCommand = 'serve';
+          
+          if (packageJson.scripts.test) projectContext.testCommand = 'test';
+        }
+        
+        // Detect project framework
+        if (packageJson.dependencies || packageJson.devDependencies) {
+          const allDeps = { ...packageJson.dependencies, ...packageJson.devDependencies };
+          if (allDeps.react) projectContext.type = 'react';
+          else if (allDeps.vue) projectContext.type = 'vue';
+          else if (allDeps.next) projectContext.type = 'nextjs';
+          else if (allDeps['@angular/core']) projectContext.type = 'angular';
+        }
+      } catch (e) {
+        // Invalid JSON, but file exists
+        projectContext.name = path.basename(process.cwd());
+      }
+    } else {
+      projectContext.name = path.basename(process.cwd());
+    }
+    
+    // Check for other project types
+    if (fs.existsSync('Cargo.toml')) {
+      projectContext.type = 'rust';
+      projectContext.devCommand = 'run';
+      projectContext.testCommand = 'test';
+    } else if (fs.existsSync('go.mod')) {
+      projectContext.type = 'go';
+      projectContext.devCommand = 'run .';
+      projectContext.testCommand = 'test ./...';
+    } else if (fs.existsSync('requirements.txt') || fs.existsSync('pyproject.toml')) {
+      projectContext.type = 'python';
+    }
+    
+    // Check for worktree setup
+    projectContext.hasWorktrees = fs.existsSync('.worktrees');
+    
+    // Check for menu script
+    projectContext.hasMenuScript = fs.existsSync('menu.sh');
+    
+    return projectContext;
+  } catch (error) {
+    // Fallback to directory name
+    projectContext.name = path.basename(process.cwd());
+    projectContext.type = 'unknown';
+    return projectContext;
+  }
+}
+
 // Get theme for session
 function getThemeForSession(sessionName) {
   const hash = hashString(sessionName);
@@ -109,6 +187,18 @@ function getThemeForSession(sessionName) {
 // Set tmux status bar colors and configuration for a session
 async function setSessionColors(sessionName, useSplitScreen = true) {
   const theme = getThemeForSession(sessionName);
+  const os = require('os');
+  
+  // Check if reattach-to-user-namespace is available on macOS
+  let hasReattach = false;
+  if (os.platform() === 'darwin') {
+    try {
+      await execPromise('which reattach-to-user-namespace');
+      hasReattach = true;
+    } catch (error) {
+      hasReattach = false;
+    }
+  }
   
   try {
     // Set status bar colors and essential configuration
@@ -131,12 +221,68 @@ async function setSessionColors(sessionName, useSplitScreen = true) {
       `tmux set-window-option -t "${sessionName}" mode-keys vi`,
       `tmux set-option -t "${sessionName}" renumber-windows on`,
       
-      // Clipboard integration
-      `tmux bind-key -t "${sessionName}" -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "pbcopy"`,
-      `tmux bind-key -t "${sessionName}" -T copy-mode-vi v send-keys -X begin-selection`,
-      `tmux bind-key -t "${sessionName}" -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "pbcopy"`,
-      `tmux bind-key -t "${sessionName}" p paste-buffer`
+      // Clipboard integration 
+      `tmux set-option -t "${sessionName}" set-clipboard on`
     ];
+    
+    // Add clipboard-specific configuration based on platform and tools
+    if (os.platform() === 'darwin') {
+      // macOS clipboard configuration
+      if (hasReattach) {
+        // Use reattach-to-user-namespace for better clipboard integration
+        commands.push(
+          `tmux set-option -t "${sessionName}" default-command "reattach-to-user-namespace -l \\$SHELL"`,
+          
+          // Mouse selection copies to system clipboard
+          `tmux bind-key -t "${sessionName}" -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "reattach-to-user-namespace pbcopy"`,
+          `tmux bind-key -t "${sessionName}" -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "reattach-to-user-namespace pbcopy"`,
+          
+          // Vi-mode copy bindings
+          `tmux bind-key -t "${sessionName}" -T copy-mode-vi v send-keys -X begin-selection`,
+          `tmux bind-key -t "${sessionName}" -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "reattach-to-user-namespace pbcopy"`,
+          `tmux bind-key -t "${sessionName}" -T copy-mode-vi Enter send-keys -X copy-pipe-and-cancel "reattach-to-user-namespace pbcopy"`,
+          
+          // Emacs-mode copy bindings
+          `tmux bind-key -t "${sessionName}" -T copy-mode M-w send-keys -X copy-pipe-and-cancel "reattach-to-user-namespace pbcopy"`,
+          `tmux bind-key -t "${sessionName}" -T copy-mode C-w send-keys -X copy-pipe-and-cancel "reattach-to-user-namespace pbcopy"`
+        );
+      } else {
+        // Use pbcopy directly
+        commands.push(
+          // Mouse selection copies to system clipboard
+          `tmux bind-key -t "${sessionName}" -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "pbcopy"`,
+          `tmux bind-key -t "${sessionName}" -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "pbcopy"`,
+          
+          // Vi-mode copy bindings
+          `tmux bind-key -t "${sessionName}" -T copy-mode-vi v send-keys -X begin-selection`,
+          `tmux bind-key -t "${sessionName}" -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "pbcopy"`,
+          `tmux bind-key -t "${sessionName}" -T copy-mode-vi Enter send-keys -X copy-pipe-and-cancel "pbcopy"`,
+          
+          // Emacs-mode copy bindings
+          `tmux bind-key -t "${sessionName}" -T copy-mode M-w send-keys -X copy-pipe-and-cancel "pbcopy"`,
+          `tmux bind-key -t "${sessionName}" -T copy-mode C-w send-keys -X copy-pipe-and-cancel "pbcopy"`
+        );
+      }
+    } else {
+      // Linux clipboard configuration
+      commands.push(
+        // Mouse selection copies to system clipboard
+        `tmux bind-key -t "${sessionName}" -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"`,
+        `tmux bind-key -t "${sessionName}" -T copy-mode MouseDragEnd1Pane send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"`,
+        
+        // Vi-mode copy bindings
+        `tmux bind-key -t "${sessionName}" -T copy-mode-vi v send-keys -X begin-selection`,
+        `tmux bind-key -t "${sessionName}" -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"`,
+        `tmux bind-key -t "${sessionName}" -T copy-mode-vi Enter send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"`,
+        
+        // Emacs-mode copy bindings
+        `tmux bind-key -t "${sessionName}" -T copy-mode M-w send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"`,
+        `tmux bind-key -t "${sessionName}" -T copy-mode C-w send-keys -X copy-pipe-and-cancel "xclip -selection clipboard -i"`
+      );
+    }
+    
+    // Paste binding (works on both platforms)
+    commands.push(`tmux bind-key -t "${sessionName}" p paste-buffer`);
     
     // Conditionally add auto split screen keybindings
     if (useSplitScreen) {
@@ -188,6 +334,30 @@ async function askSplitScreenPreference() {
   });
 }
 
+// Ask user about project-aware session setup
+async function askProjectSetupPreference() {
+  return new Promise((resolve) => {
+    console.log();
+    console.log(`${colors.yellow}Session Setup Preference:${colors.reset}`);
+    console.log(`${colors.white}1. Standard setup (single window)${colors.reset}`);
+    console.log(`${colors.white}2. Project-aware setup (multiple windows for ${projectContext.type})${colors.reset}`);
+    console.log();
+    
+    rl.question(`${colors.cyan}Choose setup (1-2, Enter for standard): ${colors.reset}`, (answer) => {
+      const choice = answer.trim();
+      const useProjectSetup = choice === '2';
+      
+      if (useProjectSetup) {
+        console.log(`${colors.green}✓ Project-aware setup selected${colors.reset}`);
+      } else {
+        console.log(`${colors.green}✓ Standard setup selected${colors.reset}`);
+      }
+      
+      resolve(useProjectSetup);
+    });
+  });
+}
+
 // Clear screen and show header
 function showHeader() {
   console.clear();
@@ -207,6 +377,24 @@ async function checkTmux() {
     console.log('Please install tmux first: brew install tmux (macOS) or apt install tmux (Ubuntu)');
     process.exit(1);
   }
+}
+
+// Check for clipboard integration tools on macOS
+async function checkClipboardTools() {
+  const os = require('os');
+  if (os.platform() === 'darwin') {
+    try {
+      await execPromise('which reattach-to-user-namespace');
+      return true;
+    } catch (error) {
+      console.log(`${colors.yellow}Note: For better clipboard integration, consider installing:${colors.reset}`);
+      console.log(`${colors.white}  brew install reattach-to-user-namespace${colors.reset}`);
+      console.log(`${colors.blue}This improves system clipboard access in tmux sessions.${colors.reset}`);
+      console.log();
+      return false;
+    }
+  }
+  return true;
 }
 
 // Get all tmux sessions
@@ -406,6 +594,83 @@ async function connectToSession() {
   }
 }
 
+// Generate project-aware session name suggestions
+function generateSessionNameSuggestions() {
+  const suggestions = [];
+  const baseName = projectContext.name || 'project';
+  
+  // Add project-based suggestions
+  suggestions.push(baseName);
+  suggestions.push(`${baseName}-dev`);
+  suggestions.push(`${baseName}-main`);
+  
+  // Add type-specific suggestions
+  if (projectContext.type) {
+    suggestions.push(`${baseName}-${projectContext.type}`);
+  }
+  
+  // Add worktree-aware suggestions
+  if (projectContext.hasWorktrees) {
+    suggestions.push(`${baseName}-feature`);
+    suggestions.push(`${baseName}-hotfix`);
+  }
+  
+  return suggestions.slice(0, 3); // Return top 3 suggestions
+}
+
+// Setup project-specific tmux session
+async function setupProjectSession(sessionName, useSplitScreen) {
+  try {
+    // Create session
+    await execPromise(`tmux new-session -d -s "${sessionName}"`);
+    
+    // Setup project-specific windows and panes
+    if (projectContext.type === 'nodejs' || projectContext.type === 'react' || projectContext.type === 'nextjs') {
+      // Create windows for Node.js projects
+      await execPromise(`tmux new-window -t "${sessionName}" -n "editor"`);
+      
+      if (projectContext.devCommand) {
+        await execPromise(`tmux new-window -t "${sessionName}" -n "dev"`);
+        await execPromise(`tmux send-keys -t "${sessionName}:dev" "npm run ${projectContext.devCommand}" Enter`);
+      }
+      
+      if (projectContext.testCommand) {
+        await execPromise(`tmux new-window -t "${sessionName}" -n "test"`);
+        await execPromise(`tmux send-keys -t "${sessionName}:test" "npm run ${projectContext.testCommand}" Enter`);
+      }
+      
+      // If has menu script, add menu window
+      if (projectContext.hasMenuScript) {
+        await execPromise(`tmux new-window -t "${sessionName}" -n "menu"`);
+        await execPromise(`tmux send-keys -t "${sessionName}:menu" "./menu.sh" Enter`);
+      }
+      
+    } else if (projectContext.type === 'rust') {
+      await execPromise(`tmux new-window -t "${sessionName}" -n "editor"`);
+      await execPromise(`tmux new-window -t "${sessionName}" -n "cargo"`);
+      await execPromise(`tmux send-keys -t "${sessionName}:cargo" "cargo run" Enter`);
+      
+    } else if (projectContext.type === 'go') {
+      await execPromise(`tmux new-window -t "${sessionName}" -n "editor"`);
+      await execPromise(`tmux new-window -t "${sessionName}" -n "go"`);
+      await execPromise(`tmux send-keys -t "${sessionName}:go" "go run ." Enter`);
+    }
+    
+    // Setup initial window with split if requested
+    if (useSplitScreen) {
+      await execPromise(`tmux split-window -h -t "${sessionName}:0" -c "#{pane_current_path}"`);
+      await execPromise(`tmux select-pane -t "${sessionName}:0.0"`);
+    }
+    
+    // Select first window
+    await execPromise(`tmux select-window -t "${sessionName}:0"`);
+    
+  } catch (error) {
+    console.log(`${colors.red}Error setting up project session: ${error.message}${colors.reset}`);
+    throw error;
+  }
+}
+
 // Create a new session
 async function createNewSession() {
   showHeader();
@@ -413,11 +678,41 @@ async function createNewSession() {
   console.log(`${colors.blue}─────────────────────────────────${colors.reset}`);
   console.log();
   
-  while (true) {
-    const sessionName = await question("Enter session name (or 'q' to quit): ");
+  // Show project context if available
+  if (projectContext.name) {
+    console.log(`${colors.cyan}Project Context:${colors.reset}`);
+    console.log(`  Name: ${colors.white}${projectContext.name}${colors.reset}`);
+    console.log(`  Type: ${colors.white}${projectContext.type || 'unknown'}${colors.reset}`);
+    if (projectContext.devCommand) {
+      console.log(`  Dev Command: ${colors.white}npm run ${projectContext.devCommand}${colors.reset}`);
+    }
+    console.log();
     
-    if (sessionName.toLowerCase() === 'q') {
+    // Show suggestions
+    const suggestions = generateSessionNameSuggestions();
+    console.log(`${colors.cyan}Suggested session names:${colors.reset}`);
+    suggestions.forEach((name, index) => {
+      console.log(`  ${index + 1}. ${colors.green}${name}${colors.reset}`);
+    });
+    console.log();
+  }
+  
+  while (true) {
+    const input = await question("Enter session name, number from suggestions, or 'q' to quit: ");
+    
+    if (input.toLowerCase() === 'q') {
       return;
+    }
+    
+    let sessionName;
+    
+    // Check if input is a number (suggestion selection)
+    if (/^[1-3]$/.test(input) && projectContext.name) {
+      const suggestions = generateSessionNameSuggestions();
+      sessionName = suggestions[parseInt(input) - 1];
+      console.log(`${colors.green}Selected: ${sessionName}${colors.reset}`);
+    } else {
+      sessionName = input;
     }
     
     if (!sessionName) {
@@ -453,6 +748,13 @@ async function createNewSession() {
       const theme = getThemeForSession(sessionName);
       console.log(`${colors.green}Creating session: ${sessionName} (${theme.name} theme)${colors.reset}`);
       
+      // Ask about project-aware setup
+      let useProjectSetup = false;
+      if (projectContext.name && projectContext.type !== 'unknown') {
+        console.log();
+        useProjectSetup = await askProjectSetupPreference();
+      }
+      
       // Ask user about split screen preference
       const useSplitScreen = await askSplitScreenPreference();
       
@@ -462,14 +764,19 @@ async function createNewSession() {
       
       await sleep(500);
       
-      // Create session in detached mode, optionally with split, then set colors, then attach
+      // Create session with project-aware setup or standard setup
       try {
-        await execPromise(`tmux new-session -d -s "${sessionName}"`);
-        
-        // Conditionally auto-split the initial window
-        if (useSplitScreen) {
-          await execPromise(`tmux split-window -h -t "${sessionName}:0" -c "#{pane_current_path}"`);
-          await execPromise(`tmux select-pane -t "${sessionName}:0.0"`);
+        if (useProjectSetup) {
+          await setupProjectSession(sessionName, useSplitScreen);
+        } else {
+          // Standard session creation
+          await execPromise(`tmux new-session -d -s "${sessionName}"`);
+          
+          // Conditionally auto-split the initial window
+          if (useSplitScreen) {
+            await execPromise(`tmux split-window -h -t "${sessionName}:0" -c "#{pane_current_path}"`);
+            await execPromise(`tmux select-pane -t "${sessionName}:0.0"`);
+          }
         }
         
         await setSessionColors(sessionName, useSplitScreen);
@@ -838,6 +1145,10 @@ process.on('SIGINT', () => {
 // Main execution
 async function main() {
   await checkTmux();
+  await checkClipboardTools();
+  
+  // Detect project context
+  await detectProjectContext();
   
   // Skip main menu and go directly to session management
   currentPage = 0;
