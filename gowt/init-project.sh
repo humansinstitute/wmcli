@@ -114,7 +114,10 @@ analyze_existing_repo() {
             DETECTED_AUTHOR=$(jq -r '.author // empty' package.json 2>/dev/null)
             
             # Get existing scripts
-            mapfile -t EXISTING_SCRIPTS < <(jq -r '.scripts | keys[]?' package.json 2>/dev/null)
+            EXISTING_SCRIPTS=()
+            while IFS= read -r script; do
+                EXISTING_SCRIPTS+=("$script")
+            done < <(jq -r '.scripts | keys[]?' package.json 2>/dev/null)
         else
             # Fallback parsing without jq
             DETECTED_PROJECT_NAME=$(grep '"name"' package.json | sed 's/.*"name": *"\([^"]*\)".*/\1/' 2>/dev/null)
@@ -226,11 +229,28 @@ determine_init_mode() {
     elif [[ "$1" == "--init" ]] || [[ "$1" == "--new" ]]; then
         MODE="init"
         print_info "Full initialization mode: Will create new project structure"
+    elif [[ "$1" == "--minimal" ]] || [[ "$1" == "--worktree-only" ]]; then
+        MODE="minimal"
+        print_info "Minimal mode: Will only add worktree management and menu"
     else
         # Auto-detect mode based on project state
         if [ "$IS_GIT_REPO" = true ] && [ "$HAS_PACKAGE_JSON" = true ]; then
             MODE="enhance"
             print_info "Auto-detected enhancement mode: Existing project found"
+        elif [ "$IS_GIT_REPO" = true ] && [ -n "$(ls -A . 2>/dev/null | grep -v '\.git')" ]; then
+            print_warning "Git repository detected with existing files"
+            echo "Choose setup mode:"
+            echo "1. Enhancement mode (add Node.js tooling if applicable)"
+            echo "2. Minimal mode (worktree management and menu only)"
+            echo "3. Full initialization (may overwrite files)"
+            echo -n "Select mode [1-3]: "
+            read mode_choice
+            case $mode_choice in
+                1) MODE="enhance" ;;
+                2) MODE="minimal" ;;
+                3) MODE="init" ;;
+                *) MODE="minimal"; print_info "Invalid choice, defaulting to minimal mode" ;;
+            esac
         elif [ -n "$(ls -A . 2>/dev/null | grep -v '\.git')" ]; then
             print_warning "Directory contains files but no clear project structure"
             if prompt_yes_no "Use enhancement mode (preserve existing files)?" "y"; then
@@ -1462,6 +1482,341 @@ EOF
     chmod +x scripts/worktree-create.sh
 }
 
+create_minimal_menu_script() {
+    print_info "Creating minimal development menu..."
+    
+    cat > menu.sh << 'EOF'
+#!/bin/bash
+
+set -e
+
+# Colors for better visibility
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m'
+
+clear_screen() {
+    clear
+}
+
+print_header() {
+    echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${WHITE}                    WINGMAN CLI MENU SYSTEM                    ${BLUE}║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo
+    
+    # Show current context
+    local current_branch=$(git branch --show-current 2>/dev/null || echo "unknown")
+    local current_dir=$(basename "$PWD")
+    echo -e "${CYAN}Project:${NC} ${current_dir}  ${CYAN}Branch:${NC} ${current_branch}"
+    
+    # Check if we're in a worktree
+    local worktree_info=$(git worktree list --porcelain 2>/dev/null | grep "$(pwd)" | head -1 || echo "")
+    if [[ -n "$worktree_info" ]]; then
+        echo -e "${PURPLE}Worktree:${NC} $(pwd)"
+    fi
+    echo
+}
+
+show_main_menu() {
+    print_header
+    echo -e "${WHITE}Main Menu:${NC}"
+    echo
+    echo -e "${GREEN}1.${NC} Switch Worktree"
+    echo -e "${GREEN}2.${NC} Create New Worktree" 
+    echo -e "${GREEN}3.${NC} Delete Worktree"
+    echo -e "${GREEN}4.${NC} Git Operations"
+    echo -e "${GREEN}5.${NC} Launch Claude Code"
+    echo -e "${GREEN}6.${NC} Launch Editor"
+    echo -e "${GREEN}7.${NC} Project Info"
+    echo
+    echo -e "${RED}0.${NC} Exit"
+    echo
+    echo -n "Select option [0-7]: "
+}
+
+show_worktree_menu() {
+    clear_screen
+    print_header
+    echo -e "${WHITE}Switch Worktree:${NC}"
+    echo
+    
+    local worktrees=$(git worktree list 2>/dev/null)
+    if [[ -z "$worktrees" ]]; then
+        echo -e "${RED}No worktrees found${NC}"
+        echo -n "Press Enter to continue..."
+        read
+        return
+    fi
+    
+    echo "$worktrees"
+    echo
+    local count=1
+    local worktree_paths=()
+    
+    while IFS= read -r line; do
+        local path=$(echo "$line" | awk '{print $1}')
+        local branch=$(echo "$line" | awk '{print $2}' | tr -d '[]')
+        worktree_paths+=("$path")
+        echo -e "${GREEN}${count}.${NC} ${CYAN}${branch}${NC} - ${path}"
+        ((count++))
+    done <<< "$worktrees"
+    
+    echo
+    echo -e "${RED}0.${NC} Back to Main Menu"
+    echo
+    echo -n "Select worktree [0-$((count-1))]: "
+    
+    read choice
+    if [[ "$choice" == "0" ]]; then
+        return
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -lt "$count" ]]; then
+        local target_path="${worktree_paths[$((choice-1))]}"
+        echo
+        echo -e "${YELLOW}Switching to: $target_path${NC}"
+        cd "$target_path" && exec bash
+    else
+        echo -e "${RED}Invalid choice!${NC}"
+        sleep 1
+    fi
+}
+
+create_worktree() {
+    clear_screen
+    print_header
+    echo -e "${WHITE}Create New Worktree:${NC}"
+    echo
+    
+    echo -n "Enter branch name: "
+    read branch_name
+    
+    if [[ -z "$branch_name" ]]; then
+        echo -e "${RED}Branch name cannot be empty!${NC}"
+        sleep 2
+        return
+    fi
+    
+    echo -n "Base branch (default: main): "
+    read base_branch
+    base_branch=${base_branch:-main}
+    
+    echo
+    echo -e "${YELLOW}Creating worktree '$branch_name' from '$base_branch'...${NC}"
+    
+    if ./scripts/worktree-create.sh "$branch_name" "$base_branch" 2>/dev/null || {
+        # Fallback if script doesn't exist
+        if git show-ref --quiet "refs/heads/$branch_name"; then
+            git worktree add ".worktrees/$branch_name" "$branch_name"
+        else
+            git worktree add -b "$branch_name" ".worktrees/$branch_name" "$base_branch"
+        fi
+    }; then
+        echo -e "${GREEN}Worktree created successfully!${NC}"
+    else
+        echo -e "${RED}Failed to create worktree${NC}"
+    fi
+    
+    echo
+    echo -n "Press Enter to continue..."
+    read
+}
+
+delete_worktree() {
+    clear_screen
+    print_header
+    echo -e "${WHITE}Delete Worktree:${NC}"
+    echo
+    
+    local worktrees=$(git worktree list 2>/dev/null | grep -v "$(git rev-parse --show-toplevel)")
+    if [[ -z "$worktrees" ]]; then
+        echo -e "${RED}No additional worktrees found to delete${NC}"
+        echo -n "Press Enter to continue..."
+        read
+        return
+    fi
+    
+    echo "$worktrees"
+    echo
+    local count=1
+    local worktree_info=()
+    
+    while IFS= read -r line; do
+        local path=$(echo "$line" | awk '{print $1}')
+        local branch=$(echo "$line" | awk '{print $2}' | tr -d '[]')
+        worktree_info+=("$path|$branch")
+        echo -e "${GREEN}${count}.${NC} ${CYAN}${branch}${NC} - ${path}"
+        ((count++))
+    done <<< "$worktrees"
+    
+    echo
+    echo -e "${RED}0.${NC} Back to Main Menu"
+    echo
+    echo -n "Select worktree to delete [0-$((count-1))]: "
+    
+    read choice
+    if [[ "$choice" == "0" ]]; then
+        return
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -lt "$count" ]]; then
+        local info="${worktree_info[$((choice-1))]}"
+        local path=$(echo "$info" | cut -d'|' -f1)
+        local branch=$(echo "$info" | cut -d'|' -f2)
+        
+        echo
+        echo -e "${RED}WARNING: This will delete worktree '$branch' at '$path'${NC}"
+        echo -n "Are you sure? [y/N]: "
+        read confirm
+        
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Deleting worktree...${NC}"
+            git worktree remove "$path" --force
+            echo -e "${GREEN}Worktree deleted successfully!${NC}"
+        else
+            echo -e "${YELLOW}Cancelled${NC}"
+        fi
+    else
+        echo -e "${RED}Invalid choice!${NC}"
+        sleep 1
+    fi
+    
+    echo
+    echo -n "Press Enter to continue..."
+    read
+}
+
+show_git_menu() {
+    clear_screen
+    print_header
+    echo -e "${WHITE}Git Operations:${NC}"
+    echo
+    echo -e "${GREEN}1.${NC} Git Status"
+    echo -e "${GREEN}2.${NC} Git Pull"
+    echo -e "${GREEN}3.${NC} Git Push"
+    echo -e "${GREEN}4.${NC} Git Log (last 5 commits)"
+    echo -e "${GREEN}5.${NC} List Branches"
+    echo
+    echo -e "${RED}0.${NC} Back to Main Menu"
+    echo
+    echo -n "Select option [0-5]: "
+    
+    read choice
+    case $choice in
+        1) clear_screen && git status && echo && echo -n "Press Enter to continue..." && read ;;
+        2) clear_screen && git pull && echo && echo -n "Press Enter to continue..." && read ;;
+        3) clear_screen && git push && echo && echo -n "Press Enter to continue..." && read ;;
+        4) clear_screen && git log --oneline -5 && echo && echo -n "Press Enter to continue..." && read ;;
+        5) clear_screen && git branch -a && echo && echo -n "Press Enter to continue..." && read ;;
+        0) return ;;
+        *) echo -e "${RED}Invalid choice!${NC}" && sleep 1 ;;
+    esac
+}
+
+launch_claude() {
+    clear_screen
+    echo -e "${YELLOW}Launching Claude Code...${NC}"
+    if command -v claude >/dev/null 2>&1; then
+        claude
+    else
+        echo -e "${RED}Claude Code not found in PATH${NC}"
+        echo -n "Press Enter to continue..."
+        read
+    fi
+}
+
+launch_editor() {
+    clear_screen
+    print_header
+    echo -e "${WHITE}Launch Editor:${NC}"
+    echo
+    echo -e "${GREEN}1.${NC} VSCode (code .)"
+    echo -e "${GREEN}2.${NC} VSCode Insiders (code-insiders .)"
+    echo -e "${GREEN}3.${NC} Vim"
+    echo -e "${GREEN}4.${NC} Nano"
+    echo
+    echo -e "${RED}0.${NC} Back to Main Menu"
+    echo
+    echo -n "Select editor [0-4]: "
+    
+    read choice
+    case $choice in
+        1) command -v code >/dev/null 2>&1 && code . || echo -e "${RED}VSCode not found${NC}" ;;
+        2) command -v code-insiders >/dev/null 2>&1 && code-insiders . || echo -e "${RED}VSCode Insiders not found${NC}" ;;
+        3) vim . ;;
+        4) nano . ;;
+        0) return ;;
+        *) echo -e "${RED}Invalid choice!${NC}" && sleep 1 ;;
+    esac
+}
+
+show_project_info() {
+    clear_screen
+    print_header
+    echo -e "${WHITE}Project Information:${NC}"
+    echo
+    
+    echo -e "${CYAN}Current Directory:${NC} $(pwd)"
+    echo -e "${CYAN}Git Branch:${NC} $(git branch --show-current 2>/dev/null || echo 'Not a git repository')"
+    
+    # Show language/framework specific info if available
+    if command -v node >/dev/null 2>&1; then
+        echo -e "${CYAN}Node Version:${NC} $(node --version)"
+    fi
+    if command -v npm >/dev/null 2>&1; then
+        echo -e "${CYAN}NPM Version:${NC} $(npm --version)"
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        echo -e "${CYAN}Python Version:${NC} $(python3 --version)"
+    fi
+    if command -v go >/dev/null 2>&1; then
+        echo -e "${CYAN}Go Version:${NC} $(go version)"
+    fi
+    if command -v cargo >/dev/null 2>&1; then
+        echo -e "${CYAN}Rust Version:${NC} $(rustc --version)"
+    fi
+    
+    echo
+    echo -n "Press Enter to continue..."
+    read
+}
+
+main_loop() {
+    while true; do
+        clear_screen
+        show_main_menu
+        read choice
+        
+        case $choice in
+            1) show_worktree_menu ;;
+            2) create_worktree ;;
+            3) delete_worktree ;;
+            4) show_git_menu ;;
+            5) launch_claude ;;
+            6) launch_editor ;;
+            7) show_project_info ;;
+            0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            *) echo -e "${RED}Invalid choice! Please select 0-7.${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# Check if we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    echo -e "${RED}Warning: This doesn't appear to be a git repository.${NC}"
+    echo "The menu system works best when run from a git repository root."
+    echo
+fi
+
+main_loop
+EOF
+    
+    chmod +x menu.sh
+    print_success "Minimal menu script created"
+}
+
 create_enhanced_menu_script() {
     print_info "Creating enhanced development menu..."
     
@@ -1821,13 +2176,37 @@ main() {
         
         setup_github_remote
         
+    elif [ "$MODE" = "minimal" ]; then
+        # Minimal mode - only worktree management and menu
+        # Create minimal scripts directory if needed
+        [ ! -d "scripts" ] && mkdir -p scripts
+        
+        setup_worktrees_enhance
+        
+        # Create a language-agnostic menu script
+        if [ ! -f "menu.sh" ]; then
+            create_minimal_menu_script
+        fi
+        
+        # Optional GitHub remote setup
+        setup_github_remote
+        
     else
         # Full initialization mode - create everything
         setup_project_structure
-        initialize_git
-        initialize_nodejs
-        setup_sqlite
-        create_env_file
+        
+        # Initialize git if not already a repo
+        if [ "$IS_GIT_REPO" = false ]; then
+            initialize_git
+        fi
+        
+        # Only setup Node.js if no other project type is detected or if requested
+        if [ "$PROJECT_TYPE" = "unknown" ] || [ "$PROJECT_TYPE" = "nodejs" ]; then
+            initialize_nodejs
+            setup_sqlite
+            create_env_file
+        fi
+        
         create_readme
         setup_worktrees
         setup_github_remote
@@ -1844,20 +2223,39 @@ main() {
         echo "  - Enhanced development menu"
         [ "$IS_NODE_PROJECT" = true ] && echo "  - Additional npm scripts"
         [ ! -f ".env" ] && echo "  - Environment configuration"
+    elif [ "$MODE" = "minimal" ]; then
+        print_success "Minimal setup complete!"
+        echo
+        print_info "Added features:"
+        echo "  - Worktree management scripts"
+        echo "  - Language-agnostic development menu"
+        echo "  - Git operations interface"
     else
         print_success "Project initialization complete!"
         echo
         print_info "Next steps:"
-        echo "  1. Run: npm install"
-        echo "  2. Run: npm run db:migrate"
-        echo "  3. Run: npm run dev"
+        if [ "$PROJECT_TYPE" = "nodejs" ] || [ "$PROJECT_TYPE" = "unknown" ]; then
+            echo "  1. Run: npm install"
+            echo "  2. Run: npm run db:migrate"
+            echo "  3. Run: npm run dev"
+        else
+            echo "  1. Customize your project as needed"
+            echo "  2. Use ./menu.sh for worktree management"
+            echo "  3. Use worktree scripts in scripts/ directory"
+        fi
     fi
     
     echo
     print_info "Wingman CLI commands:"
-    echo "  - Switch worktree: npm run worktree:switch <branch>"
-    echo "  - Create worktree: npm run worktree:create <branch>"
-    echo "  - Development menu: npm run menu"
+    if [ "$IS_NODE_PROJECT" = true ] && [ "$MODE" != "minimal" ]; then
+        echo "  - Switch worktree: npm run worktree:switch <branch>"
+        echo "  - Create worktree: npm run worktree:create <branch>"
+        echo "  - Development menu: npm run menu"
+    else
+        echo "  - Switch worktree: ./scripts/worktree-switch.sh <branch>"
+        echo "  - Create worktree: ./scripts/worktree-create.sh <branch>"
+        echo "  - Development menu: ./menu.sh"
+    fi
     echo
     
     if [ -n "$GITHUB_REPO" ]; then
