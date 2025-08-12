@@ -1103,7 +1103,11 @@ setup_github_remote() {
     if [ -n "$GITHUB_REPO" ]; then
         print_info "Configuring GitHub remote..."
         
-        if [[ "$GITHUB_REPO" =~ ^https://github.com/.+/.+$ ]]; then
+        if [[ "$GITHUB_REPO" =~ ^https://github.com/.+/.+\.git$ ]]; then
+            git remote add origin "$GITHUB_REPO" 2>/dev/null || {
+                git remote set-url origin "$GITHUB_REPO"
+            }
+        elif [[ "$GITHUB_REPO" =~ ^https://github.com/.+/.+$ ]]; then
             git remote add origin "$GITHUB_REPO.git" 2>/dev/null || {
                 git remote set-url origin "$GITHUB_REPO.git"
             }
